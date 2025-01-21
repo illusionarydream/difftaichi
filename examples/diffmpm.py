@@ -21,8 +21,8 @@ E = 10
 # TODO: update
 mu = E
 la = E
-max_steps = 2048
-steps = 1024
+max_steps = 4096
+steps = 4096
 gravity = 3.8
 target = [0.8, 0.2]
 
@@ -91,6 +91,8 @@ def clear_actuation_grad():
 
 @ti.kernel
 def p2g(f: ti.i32):
+    # input: step f
+    # * APIC transfer
     for p in range(n_particles):
         base = ti.cast(x[f, p] * inv_dx - 0.5, ti.i32)
         fx = x[f, p] * inv_dx - ti.cast(base, ti.i32)
@@ -114,10 +116,10 @@ def p2g(f: ti.i32):
         A = ti.Matrix([[0.0, 0.0], [0.0, 1.0]]) * act
         cauchy = ti.Matrix([[0.0, 0.0], [0.0, 0.0]])
         mass = 0.0
-        if particle_type[p] == 0:
+        if particle_type[p] == 0: # fluid
             mass = 4
             cauchy = ti.Matrix([[1.0, 0.0], [0.0, 0.1]]) * (J - 1) * E
-        else:
+        else: # solid
             mass = 1
             cauchy = 2 * mu * (new_F - r) @ new_F.transpose() + \
                      ti.Matrix.diag(2, la * (J - 1) * J)
@@ -144,6 +146,9 @@ def grid_op():
         inv_m = 1 / (grid_m_in[i, j] + 1e-10)
         v_out = inv_m * grid_v_in[i, j]
         v_out[1] -= dt * gravity
+
+        # boundary conditions: velocity is zero when it is moving into the wall
+        # collision handling: impulsive reflection
         if i < bound and v_out[0] < 0:
             v_out[0] = 0
             v_out[1] = 0
@@ -178,10 +183,11 @@ def grid_op():
 
 @ti.kernel
 def g2p(f: ti.i32):
+    # input: step f
     for p in range(n_particles):
         base = ti.cast(x[f, p] * inv_dx - 0.5, ti.i32)
         fx = x[f, p] * inv_dx - ti.cast(base, real)
-        w = [0.5 * (1.5 - fx)**2, 0.75 - (fx - 1.0)**2, 0.5 * (fx - 0.5)**2]
+        w = [0.5 * (1.5 - fx)**2, 0.75 - (fx - 1.0)**2, 0.5 * (fx - 0.5)**2] # Quadratic B-spline
         new_v = ti.Vector([0.0, 0.0])
         new_C = ti.Matrix([[0.0, 0.0], [0.0, 0.0]])
 
@@ -200,8 +206,11 @@ def g2p(f: ti.i32):
 
 @ti.kernel
 def compute_actuation(t: ti.i32):
+    # input: step t
     for i in range(n_actuators):
         act = 0.0
+
+        # act is predicted by a linear combination of sin waves
         for j in ti.static(range(n_sin_waves)):
             act += weights[i, j] * ti.sin(actuation_omega * t * dt +
                                           2 * math.pi / n_sin_waves * j)
@@ -211,6 +220,7 @@ def compute_actuation(t: ti.i32):
 
 @ti.kernel
 def compute_x_avg():
+    # compute the average x position of solid particles
     for i in range(n_particles):
         contrib = 0.0
         if particle_type[i] == 1:
@@ -220,6 +230,7 @@ def compute_x_avg():
 
 @ti.kernel
 def compute_loss():
+    # minimizing the loss is equivalent to maximizing the marching distance.
     dist = x_avg[None][0]
     loss[None] = -dist
 
@@ -249,6 +260,8 @@ def forward(total_steps=steps):
     # simulation
     for s in range(total_steps - 1):
         advance(s)
+
+    # compute loss
     x_avg[None] = [0, 0]
     compute_x_avg()
     compute_loss()
@@ -258,13 +271,15 @@ class Scene:
     def __init__(self):
         self.n_particles = 0
         self.n_solid_particles = 0
-        self.x = []
+        self.x = [] # particle positions
         self.actuator_id = []
-        self.particle_type = []
+        self.particle_type = [] # 0: fluid, 1: solid
         self.offset_x = 0
         self.offset_y = 0
 
+
     def add_rect(self, x, y, w, h, actuation, ptype=1):
+        # add a rectangle of particles
         if ptype == 0:
             assert actuation == -1
         global n_particles
@@ -311,11 +326,11 @@ def fish(scene):
 
 def robot(scene):
     scene.set_offset(0.1, 0.03)
-    scene.add_rect(0.0, 0.1, 0.3, 0.1, -1)
-    scene.add_rect(0.0, 0.0, 0.05, 0.1, 0)
-    scene.add_rect(0.05, 0.0, 0.05, 0.1, 1)
-    scene.add_rect(0.2, 0.0, 0.05, 0.1, 2)
-    scene.add_rect(0.25, 0.0, 0.05, 0.1, 3)
+    scene.add_rect(0.0, 0.05, 0.15, 0.05, -1)
+    scene.add_rect(0.0, 0.0, 0.025, 0.05, 0)
+    scene.add_rect(0.025, 0.0, 0.025, 0.05, 1)
+    scene.add_rect(0.1, 0.0, 0.025, 0.05, 2)
+    scene.add_rect(0.125, 0.0, 0.025, 0.05, 3)
     scene.set_n_actuators(4)
 
 
@@ -341,13 +356,28 @@ def visualize(s, folder):
 
 
 def main():
+    # parse arguments
     parser = argparse.ArgumentParser()
     parser.add_argument('--iters', type=int, default=100)
+    parser.add_argument('--steps', type=int, default=4096)
+    parser.add_argument('--scene_type', type=str, default='robot')
     options = parser.parse_args()
+
+    steps = options.steps
+    iters = options.iters
+    scene_type = options.scene_type
+
+    print('experiment settings:')
+    print('scene_type', scene_type)
+    print('steps', steps)
+    print('iters', iters)
 
     # initialization
     scene = Scene()
-    robot(scene)
+    if scene_type == 'fish':
+        fish(scene)
+    elif scene_type == 'robot':
+        robot(scene)
     scene.finalize()
     allocate_fields()
 
@@ -362,7 +392,9 @@ def main():
         particle_type[i] = scene.particle_type[i]
 
     losses = []
-    for iter in range(options.iters):
+
+    # training
+    for iter in range(iters):
         with ti.ad.Tape(loss):
             forward()
         l = loss[None]
@@ -378,8 +410,8 @@ def main():
 
         if iter % 10 == 0:
             # visualize
-            forward(1500)
-            for s in range(15, 1500, 16):
+            forward(steps)
+            for s in range(15, steps, 16):
                 visualize(s, 'diffmpm/iter{:03d}/'.format(iter))
 
     # ti.profiler_print()
@@ -387,7 +419,8 @@ def main():
     plt.ylabel("Loss")
     plt.xlabel("Gradient Descent Iterations")
     plt.plot(losses)
-    plt.show()
+    # plt.show()
+    plt.savefig('diffmpm/loss/{:s}_{:d}.png'.format(scene_type, steps))
 
 
 if __name__ == '__main__':
