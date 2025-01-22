@@ -231,8 +231,14 @@ def compute_x_avg():
 @ti.kernel
 def compute_loss():
     # minimizing the loss is equivalent to maximizing the marching distance.
-    dist = x_avg[None][0]
-    loss[None] = -dist
+    # dist = x_avg[None][0]
+    # loss[None] = -dist
+
+    for i in range(n_particles):
+        contrib = 0.0
+        if particle_type[i] == 1:
+            contrib = 1.0 / n_solid_particles
+        loss[None] +=  -contrib * x[steps - 1, i][0]
 
 
 @ti.ad.grad_replaced
@@ -263,7 +269,7 @@ def forward(total_steps=steps):
 
     # compute loss
     x_avg[None] = [0, 0]
-    compute_x_avg()
+    # compute_x_avg()
     compute_loss()
 
 
@@ -402,9 +408,14 @@ def main():
         print('i=', iter, 'loss=', l)
         learning_rate = 0.1
 
+        for i in range(n_particles):
+            print(x.grad[steps - 1, i], x[steps - 1, i])
+        
+        assert False
+
         for i in range(n_actuators):
             for j in range(n_sin_waves):
-                # print(weights.grad[i, j])
+                print(weights.grad[i, j])
                 weights[i, j] -= learning_rate * weights.grad[i, j]
             bias[i] -= learning_rate * bias.grad[i]
 

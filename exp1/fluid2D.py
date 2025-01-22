@@ -10,6 +10,7 @@ ti.init(default_fp=real, arch=ti.gpu, flatten_if=True)
 
 dim = 2
 n_particles = 8192
+inv_n_particles = 1 / n_particles
 n_solid_particles = 0
 n_grid = 128
 dx = 1 / n_grid
@@ -212,7 +213,8 @@ def g2p(f: ti.i32):
         x[f + 1, p] = x[f, p] + dt * v[f + 1, p]
         C[f + 1, p] = new_C
 
-# @ti.ad.grad_replaced
+
+@ti.ad.grad_replaced
 def advance(s):
     clear_grid()
     p2g(s)
@@ -220,16 +222,21 @@ def advance(s):
     g2p(s)
 
 
-# @ti.ad.grad_for(advance)
-# def advance_grad(s):
-#     clear_grid()
-#     p2g(s)
-#     grid_op()
+@ti.ad.grad_for(advance)
+def advance_grad(s):
+    clear_grid()
+    p2g(s)
+    grid_op()
 
-#     g2p.grad(s)
-#     grid_op.grad()
-#     p2g.grad(s)
+    g2p.grad(s)
+    grid_op.grad()
+    p2g.grad(s)
 
+@ti.kernel
+def compute_loss():
+    for p in range(n_particles):
+        if x[steps - 1, p][0] > target_left or x[steps - 1, p][0] < target_right:
+            loss[None] += - x[steps - 1, p][0] * inv_n_particles # grad = -1 / n_particles
 
 def forward(total_steps=steps):
     # simulation
@@ -237,6 +244,8 @@ def forward(total_steps=steps):
         advance(s)
 
     # compute loss
+    loss[None] = 0
+    compute_loss()
 
 
 class Scene:
@@ -342,18 +351,23 @@ def main():
 
     # training
     for iter in range(iters):
-        # with ti.ad.Tape(loss):
-        # forward()
-        # l = loss[None]
-        # losses.append(l)
-        # print('i=', iter, 'loss=', l)
-        # learning_rate = 0.1
+        with ti.ad.Tape(loss):
+            forward()
+        l = loss[None]
+        losses.append(l)
+        print('i=', iter, 'loss=', l)
+        learning_rate = 1E-14
 
-        # if iter % 10 == 0:
-        # visualize
-        forward(steps)
-        for s in range(15, steps, 16):
-            visualize(s, 'diffmpm/iter{:03d}/'.format(iter))
+        if not np.isnan(theta.grad[None]) and not np.isnan(H.grad[None]):
+            print('H.grad', H.grad[None], 'theta.grad', theta.grad[None])
+            theta[None] -= learning_rate * theta.grad[None]
+            H[None] -= learning_rate * H.grad[None]
+
+        if iter % 10 == 0:
+            # visualize
+            forward(steps)
+            for s in range(15, steps, 16):
+                visualize(s, 'diffmpm/iter{:03d}/'.format(iter))
 
     # ti.profiler_print()
     plt.title("Optimization of Initial Velocity")
