@@ -11,54 +11,47 @@ ti.init(default_fp=real, arch=ti.gpu, flatten_if=True)
 dim = 2
 n_particles = 8192
 n_solid_particles = 0
-n_actuators = 0
 n_grid = 128
 dx = 1 / n_grid
 inv_dx = 1 / dx
 dt = 1e-3
 p_vol = 1
-E = 10
+E = 20
+
+# baffles
+L = 0.4 # length of the baffle.
+inv_L = 1 / L
+target_left = 0.7
+target_right = 0.9
+target_height = 0.2
+
 # TODO: update
 mu = E
 la = E
 max_steps = 4096
 steps = 4096
 gravity = 3.8
-target = [0.8, 0.2]
 
 scalar = lambda: ti.field(dtype=real)
 vec = lambda: ti.Vector.field(dim, dtype=real)
 mat = lambda: ti.Matrix.field(dim, dim, dtype=real)
 
-actuator_id = ti.field(ti.i32)
 particle_type = ti.field(ti.i32)
 x, v = vec(), vec()
 grid_v_in, grid_m_in = vec(), scalar()
 grid_v_out = vec()
 C, F = mat(), mat()
 
+# optimization variables
+H = scalar()
+theta = scalar()
 loss = scalar()
 
-n_sin_waves = 4
-weights = scalar()
-bias = scalar()
-x_avg = vec()
-
-actuation = scalar()
-actuation_omega = 20
-act_strength = 4
-
-
-
 def allocate_fields():
-    ti.root.dense(ti.ij, (n_actuators, n_sin_waves)).place(weights)
-    ti.root.dense(ti.i, n_actuators).place(bias)
-
-    ti.root.dense(ti.ij, (max_steps, n_actuators)).place(actuation)
-    ti.root.dense(ti.i, n_particles).place(actuator_id, particle_type)
     ti.root.dense(ti.k, max_steps).dense(ti.l, n_particles).place(x, v, C, F)
+    ti.root.dense(ti.i, n_particles).place(particle_type)
     ti.root.dense(ti.ij, n_grid).place(grid_v_in, grid_m_in, grid_v_out)
-    ti.root.place(loss, x_avg)
+    ti.root.place(loss, H, theta)
 
     ti.root.lazy_grad()
 
@@ -84,12 +77,6 @@ def clear_particle_grad():
 
 
 @ti.kernel
-def clear_actuation_grad():
-    for t, i in actuation:
-        actuation[t, i] = 0.0
-
-
-@ti.kernel
 def p2g(f: ti.i32):
     # input: step f
     # * APIC transfer
@@ -106,14 +93,6 @@ def p2g(f: ti.i32):
         F[f + 1, p] = new_F
         r, s = ti.polar_decompose(new_F)
 
-        act_id = actuator_id[p]
-
-        act = actuation[f, ti.max(0, act_id)] * act_strength
-        if act_id == -1:
-            act = 0.0
-        # ti.print(act)
-
-        A = ti.Matrix([[0.0, 0.0], [0.0, 1.0]]) * act
         cauchy = ti.Matrix([[0.0, 0.0], [0.0, 0.0]])
         mass = 0.0
         if particle_type[p] == 0: # fluid
@@ -123,7 +102,6 @@ def p2g(f: ti.i32):
             mass = 1
             cauchy = 2 * mu * (new_F - r) @ new_F.transpose() + \
                      ti.Matrix.diag(2, la * (J - 1) * J)
-        cauchy += new_F @ A @ new_F.transpose()
         stress = -(dt * p_vol * 4 * inv_dx * inv_dx) * cauchy
         affine = stress + mass * C[f, p]
         for i in ti.static(range(3)):
@@ -136,9 +114,9 @@ def p2g(f: ti.i32):
                 grid_m_in[base + offset] += weight * mass
 
 
-bound = 3
-coeff = 0.5
-
+bound = 4
+bound_baffle = 2.5
+coeff = 0.9
 
 @ti.kernel
 def grid_op():
@@ -148,7 +126,6 @@ def grid_op():
         v_out[1] -= dt * gravity
 
         # boundary conditions: velocity is zero when it is moving into the wall
-        # collision handling: impulsive reflection
         if i < bound and v_out[0] < 0:
             v_out[0] = 0
             v_out[1] = 0
@@ -178,6 +155,38 @@ def grid_op():
             v_out[0] = 0
             v_out[1] = 0
 
+
+        # baffle1: box with two vertical walls
+        if j < target_height * inv_dx:
+            # -> left wall <- and -> right wall <-
+            if (i > target_left * inv_dx - bound_baffle and i < target_left * inv_dx and v_out[0] > 0) or \
+            (i > target_left * inv_dx and i < target_left * inv_dx + bound_baffle and v_out[0] < 0) or \
+            (i > target_right * inv_dx - bound_baffle and i < target_right * inv_dx and v_out[0] > 0) or \
+            (i > target_right * inv_dx and i < target_right * inv_dx + bound_baffle and v_out[0] < 0 ):
+                v_out[0] = 0
+
+        
+        # baffle2: sloping side panels
+        # ! Apply impulse reflection, may not be differentiable
+        left_endpoint = [0, H[None]]
+        right_endpoint = [L * ti.sin(theta[None]), H[None] - L * ti.cos(theta[None])]
+        if i < right_endpoint[0] * inv_dx:
+            dist_p2l =((right_endpoint[0] - left_endpoint[0]) * (left_endpoint[1] - j * dx) - \
+                        (right_endpoint[1] - left_endpoint[1]) * (left_endpoint[0] - i * dx)) * inv_L            
+            if dist_p2l < bound_baffle * dx and dist_p2l > -bound_baffle * dx:
+                normal = ti.Vector([- right_endpoint[1] + left_endpoint[1], - left_endpoint[0] + right_endpoint[0]])
+                normal /= normal.norm()
+                lin = v_out.dot(normal)
+
+                if (lin < 0 and dist_p2l < 0) or (lin > 0 and dist_p2l > 0):
+                    vit = v_out - lin * normal
+                    lit = vit.norm() + 1e-10
+                    if lit + coeff * lin <= 0:
+                        v_out[0] = 0
+                        v_out[1] = 0
+                    else:
+                        v_out = (1 + coeff * lin / lit) * vit
+
         grid_v_out[i, j] = v_out
 
 
@@ -203,57 +212,23 @@ def g2p(f: ti.i32):
         x[f + 1, p] = x[f, p] + dt * v[f + 1, p]
         C[f + 1, p] = new_C
 
-
-@ti.kernel
-def compute_actuation(t: ti.i32):
-    # input: step t
-    for i in range(n_actuators):
-        act = 0.0
-
-        # act is predicted by a linear combination of sin waves
-        for j in ti.static(range(n_sin_waves)):
-            act += weights[i, j] * ti.sin(actuation_omega * t * dt +
-                                          2 * math.pi / n_sin_waves * j)
-        act += bias[i]
-        actuation[t, i] = ti.tanh(act)
-
-
-@ti.kernel
-def compute_x_avg():
-    # compute the average x position of solid particles
-    for i in range(n_particles):
-        contrib = 0.0
-        if particle_type[i] == 1:
-            contrib = 1.0 / n_solid_particles
-        ti.atomic_add(x_avg[None], contrib * x[steps - 1, i])
-
-
-@ti.kernel
-def compute_loss():
-    # minimizing the loss is equivalent to maximizing the marching distance.
-    dist = x_avg[None][0]
-    loss[None] = -dist
-
-
-@ti.ad.grad_replaced
+# @ti.ad.grad_replaced
 def advance(s):
     clear_grid()
-    compute_actuation(s)
     p2g(s)
     grid_op()
     g2p(s)
 
 
-@ti.ad.grad_for(advance)
-def advance_grad(s):
-    clear_grid()
-    p2g(s)
-    grid_op()
+# @ti.ad.grad_for(advance)
+# def advance_grad(s):
+#     clear_grid()
+#     p2g(s)
+#     grid_op()
 
-    g2p.grad(s)
-    grid_op.grad()
-    p2g.grad(s)
-    compute_actuation.grad(s)
+#     g2p.grad(s)
+#     grid_op.grad()
+#     p2g.grad(s)
 
 
 def forward(total_steps=steps):
@@ -262,9 +237,6 @@ def forward(total_steps=steps):
         advance(s)
 
     # compute loss
-    x_avg[None] = [0, 0]
-    compute_x_avg()
-    compute_loss()
 
 
 class Scene:
@@ -272,16 +244,16 @@ class Scene:
         self.n_particles = 0
         self.n_solid_particles = 0
         self.x = [] # particle positions
-        self.actuator_id = []
         self.particle_type = [] # 0: fluid, 1: solid
         self.offset_x = 0
         self.offset_y = 0
 
+        self.H = 0
+        self.theta = 0
 
-    def add_rect(self, x, y, w, h, actuation, ptype=1):
+
+    def add_rect(self, x, y, w, h, ptype=1):
         # add a rectangle of particles
-        if ptype == 0:
-            assert actuation == -1
         global n_particles
         w_count = int(w / dx) * 2
         h_count = int(h / dx) * 2
@@ -293,10 +265,13 @@ class Scene:
                     x + (i + 0.5) * real_dx + self.offset_x,
                     y + (j + 0.5) * real_dy + self.offset_y
                 ])
-                self.actuator_id.append(actuation)
                 self.particle_type.append(ptype)
                 self.n_particles += 1
                 self.n_solid_particles += int(ptype == 1)
+
+    def initialize_baffle(self, h, t):
+        self.H = h
+        self.theta = t
 
     def set_offset(self, x, y):
         self.offset_x = x
@@ -309,47 +284,28 @@ class Scene:
         print('n_particles', n_particles)
         print('n_solid', n_solid_particles)
 
-    def set_n_actuators(self, n_act):
-        global n_actuators
-        n_actuators = n_act
 
-
-def fish(scene):
-    scene.add_rect(0.025, 0.025, 0.95, 0.1, -1, ptype=0)
-    scene.add_rect(0.1, 0.2, 0.15, 0.05, -1)
-    scene.add_rect(0.1, 0.15, 0.025, 0.05, 0)
-    scene.add_rect(0.125, 0.15, 0.025, 0.05, 1)
-    scene.add_rect(0.2, 0.15, 0.025, 0.05, 2)
-    scene.add_rect(0.225, 0.15, 0.025, 0.05, 3)
-    scene.set_n_actuators(4)
-
-
-def robot(scene):
-    scene.set_offset(0.1, 0.03)
-    scene.add_rect(0.0, 0.05, 0.15, 0.05, -1)
-    scene.add_rect(0.0, 0.0, 0.025, 0.05, 0)
-    scene.add_rect(0.025, 0.0, 0.025, 0.05, 1)
-    scene.add_rect(0.1, 0.0, 0.025, 0.05, 2)
-    scene.add_rect(0.125, 0.0, 0.025, 0.05, 3)
-    scene.set_n_actuators(4)
+def build_scene(scene):
+    scene.add_rect(0.1, 0.7, 0.2, 0.2, ptype=0)
+    scene.initialize_baffle(0.7, math.pi / 3)
 
 
 gui = ti.GUI("Differentiable MPM", (640, 640), background_color=0xFFFFFF)
 
 
 def visualize(s, folder):
-    aid = actuator_id.to_numpy()
-    colors = np.empty(shape=n_particles, dtype=np.uint32)
+    # visualize particles
     particles = x.to_numpy()[s]
-    actuation_ = actuation.to_numpy()
-    for i in range(n_particles):
-        color = 0x111111
-        if aid[i] != -1:
-            act = actuation_[s - 1, int(aid[i])]
-            color = ti.rgb_to_hex((0.5 - act, 0.5 - abs(act), 0.5 + act))
-        colors[i] = color
-    gui.circles(pos=particles, color=colors, radius=1.5)
-    gui.line((0.05, 0.02), (0.95, 0.02), radius=3, color=0x0)
+    gui.circles(pos=particles, color=0x0, radius=1.5)
+
+    # visualize boundaries
+    delta_H = 3 * dx
+    gui.line((0.05, delta_H), (0.95, delta_H), radius=4, color=0x0)
+
+    # visualize baffle
+    gui.line((0, delta_H + H[None]), (L * math.sin(theta[None]), delta_H + H[None] - L * math.cos(theta[None])), radius=4, color=0x0)
+    gui.line((target_left, delta_H), (target_left, target_height), radius=4, color=0x0)
+    gui.line((target_right, delta_H), (target_right, target_height), radius=4, color=0x0)
 
     os.makedirs(folder, exist_ok=True)
     gui.show(f'{folder}/{s:04d}.png')
@@ -360,67 +316,52 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--iters', type=int, default=100)
     parser.add_argument('--steps', type=int, default=4096)
-    parser.add_argument('--scene_type', type=str, default='fish')
     options = parser.parse_args()
 
     steps = options.steps
     iters = options.iters
-    scene_type = options.scene_type
 
     print('experiment settings:')
-    print('scene_type', scene_type)
     print('steps', steps)
     print('iters', iters)
 
-    # initialization
+    # initialize scene
     scene = Scene()
-    if scene_type == 'fish':
-        fish(scene)
-    elif scene_type == 'robot':
-        robot(scene)
+    build_scene(scene)
     scene.finalize()
     allocate_fields()
 
-    for i in range(n_actuators):
-        for j in range(n_sin_waves):
-            weights[i, j] = np.random.randn() * 0.01
-
+    H[None] = scene.H
+    theta[None] = scene.theta
     for i in range(scene.n_particles):
         x[0, i] = scene.x[i]
         F[0, i] = [[1, 0], [0, 1]]
-        actuator_id[i] = scene.actuator_id[i]
         particle_type[i] = scene.particle_type[i]
 
     losses = []
 
     # training
     for iter in range(iters):
-        with ti.ad.Tape(loss):
-            forward()
-        l = loss[None]
-        losses.append(l)
-        print('i=', iter, 'loss=', l)
-        learning_rate = 0.1
+        # with ti.ad.Tape(loss):
+        # forward()
+        # l = loss[None]
+        # losses.append(l)
+        # print('i=', iter, 'loss=', l)
+        # learning_rate = 0.1
 
-        for i in range(n_actuators):
-            for j in range(n_sin_waves):
-                # print(weights.grad[i, j])
-                weights[i, j] -= learning_rate * weights.grad[i, j]
-            bias[i] -= learning_rate * bias.grad[i]
-
-        if iter % 10 == 0:
-            # visualize
-            forward(steps)
-            for s in range(15, steps, 16):
-                visualize(s, 'diffmpm/iter{:03d}/'.format(iter))
+        # if iter % 10 == 0:
+        # visualize
+        forward(steps)
+        for s in range(15, steps, 16):
+            visualize(s, 'diffmpm/iter{:03d}/'.format(iter))
 
     # ti.profiler_print()
     plt.title("Optimization of Initial Velocity")
     plt.ylabel("Loss")
     plt.xlabel("Gradient Descent Iterations")
     plt.plot(losses)
-    # plt.show()
-    plt.savefig('diffmpm/loss/{:s}_{:d}.png'.format(scene_type, steps))
+    plt.show()
+    # plt.savefig('exp1/loss/fluid_{:d}.png'.format(steps))
 
 
 if __name__ == '__main__':

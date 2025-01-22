@@ -24,8 +24,8 @@ E = 10
 # TODO: update
 mu = E
 la = E
-max_steps = 512
-steps = 512
+max_steps = 128
+steps = 128
 gravity = 10
 target = [0.8, 0.2, 0.2]
 use_apic = False
@@ -437,13 +437,12 @@ def init(x_: ti.types.ndarray(element_dim=1), actuator_id_arr: ti.types.ndarray(
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--iters', type=int, default=100)
+    parser.add_argument('--steps', type=int, default=512)
     options = parser.parse_args()
 
     # initialization
     scene = Scene()
-    # fish(scene)
     robot(scene)
-    # scene.add_rect(0.4, 0.4, 0.2, 0.1, 0.3, 0.1, -1, 1)
     scene.finalize()
     allocate_fields()
 
@@ -516,7 +515,8 @@ def main():
     plt.ylabel("Loss")
     plt.xlabel("Gradient Descent Iterations")
     plt.plot(losses)
-    plt.show()
+    # plt.show()
+    plt.savefig('loss.png')
 
 
 if __name__ == '__main__':
