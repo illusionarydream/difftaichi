@@ -6,7 +6,7 @@ import numpy as np
 import matplotlib.pyplot as plt
 
 real = ti.f32
-ti.init(default_fp=real, arch=ti.gpu, flatten_if=True)
+ti.init(default_fp=real, arch=ti.gpu, flatten_if=True, debug=True)
 
 dim = 2
 n_particles = 8192
@@ -21,6 +21,7 @@ E = 20
 
 # baffles
 L = 0.4 # length of the baffle.
+H = 0.7 # height of the baffle.
 inv_L = 1 / L
 target_left = 0.7
 target_right = 0.9
@@ -44,7 +45,6 @@ grid_v_out = vec()
 C, F = mat(), mat()
 
 # optimization variables
-H = scalar()
 theta = scalar()
 loss = scalar()
 
@@ -52,7 +52,7 @@ def allocate_fields():
     ti.root.dense(ti.k, max_steps).dense(ti.l, n_particles).place(x, v, C, F)
     ti.root.dense(ti.i, n_particles).place(particle_type)
     ti.root.dense(ti.ij, n_grid).place(grid_v_in, grid_m_in, grid_v_out)
-    ti.root.place(loss, H, theta)
+    ti.root.place(loss, theta)
 
     ti.root.lazy_grad()
 
@@ -75,6 +75,22 @@ def clear_particle_grad():
         v.grad[f, i] = [0, 0]
         C.grad[f, i] = [[0, 0], [0, 0]]
         F.grad[f, i] = [[0, 0], [0, 0]]
+
+
+@ti.kernel
+def clear_particle_grad():
+    for f, i in x:
+        x.grad[f, i] = [0, 0]
+        v.grad[f, i] = [0, 0]
+        C.grad[f, i] = [[0, 0], [0, 0]]
+        F.grad[f, i] = [[0, 0], [0, 0]]
+
+
+def clear_grad():
+    clear_particle_grad()
+    clear_particle_grad()
+    loss[None] = 0
+    theta.grad[None] = 0
 
 
 @ti.kernel
@@ -169,8 +185,8 @@ def grid_op():
         
         # baffle2: sloping side panels
         # ! Apply impulse reflection, may not be differentiable
-        left_endpoint = [0, H[None]]
-        right_endpoint = [L * ti.sin(theta[None]), H[None] - L * ti.cos(theta[None])]
+        left_endpoint = [0, H]
+        right_endpoint = [L * ti.sin(theta[None]), H - L * ti.cos(theta[None])]
         if i < right_endpoint[0] * inv_dx:
             dist_p2l =((right_endpoint[0] - left_endpoint[0]) * (left_endpoint[1] - j * dx) - \
                         (right_endpoint[1] - left_endpoint[1]) * (left_endpoint[0] - i * dx)) * inv_L            
@@ -228,15 +244,25 @@ def advance_grad(s):
     p2g(s)
     grid_op()
 
-    g2p.grad(s)
+    # ? debug
+    # if s == 0:
+    #     print("s=", s)
+    #     k = s + 1
+    #     for i in range(10):
+    #         if x.grad[k, i][0] != 0.0:
+    #             print(x.grad[k, i], x[k, i])
+    #     assert False
+        
+
+    g2p.grad(s) # ! after this step, the grad of x[s, p] will be reset as 0. But why?
     grid_op.grad()
     p2g.grad(s)
 
 @ti.kernel
 def compute_loss():
     for p in range(n_particles):
-        if x[steps - 1, p][0] > target_left or x[steps - 1, p][0] < target_right:
-            loss[None] += - x[steps - 1, p][0] * inv_n_particles # grad = -1 / n_particles
+        if x[steps - 1, p][0] > 0 and x[steps - 1, p][0] < 1:
+            loss[None] += (x[steps - 1, p][0] - (target_left + target_right)/2) ** 2 * 1E-8
 
 def forward(total_steps=steps):
     # simulation
@@ -257,7 +283,6 @@ class Scene:
         self.offset_x = 0
         self.offset_y = 0
 
-        self.H = 0
         self.theta = 0
 
 
@@ -278,8 +303,7 @@ class Scene:
                 self.n_particles += 1
                 self.n_solid_particles += int(ptype == 1)
 
-    def initialize_baffle(self, h, t):
-        self.H = h
+    def initialize_baffle(self, t):
         self.theta = t
 
     def set_offset(self, x, y):
@@ -296,7 +320,7 @@ class Scene:
 
 def build_scene(scene):
     scene.add_rect(0.1, 0.7, 0.2, 0.2, ptype=0)
-    scene.initialize_baffle(0.7, math.pi / 3)
+    scene.initialize_baffle(math.pi / 3)
 
 
 gui = ti.GUI("Differentiable MPM", (640, 640), background_color=0xFFFFFF)
@@ -312,7 +336,7 @@ def visualize(s, folder):
     gui.line((0.05, delta_H), (0.95, delta_H), radius=4, color=0x0)
 
     # visualize baffle
-    gui.line((0, delta_H + H[None]), (L * math.sin(theta[None]), delta_H + H[None] - L * math.cos(theta[None])), radius=4, color=0x0)
+    gui.line((0, delta_H + H), (L * math.sin(theta[None]), delta_H + H - L * math.cos(theta[None])), radius=4, color=0x0)
     gui.line((target_left, delta_H), (target_left, target_height), radius=4, color=0x0)
     gui.line((target_right, delta_H), (target_right, target_height), radius=4, color=0x0)
 
@@ -340,7 +364,6 @@ def main():
     scene.finalize()
     allocate_fields()
 
-    H[None] = scene.H
     theta[None] = scene.theta
     for i in range(scene.n_particles):
         x[0, i] = scene.x[i]
@@ -351,19 +374,21 @@ def main():
 
     # training
     for iter in range(iters):
-        with ti.ad.Tape(loss):
-            forward()
-        l = loss[None]
-        losses.append(l)
-        print('i=', iter, 'loss=', l)
-        learning_rate = 1E-14
+        # clear_grad()
+        # with ti.ad.Tape(loss, validation=True):
+        #     forward()
+        # l = loss[None]
+        # losses.append(l)
+        # print('i=', iter, 'loss=', l)
+        # learning_rate = 1E-9
 
-        if not np.isnan(theta.grad[None]) and not np.isnan(H.grad[None]):
-            print('H.grad', H.grad[None], 'theta.grad', theta.grad[None])
-            theta[None] -= learning_rate * theta.grad[None]
-            H[None] -= learning_rate * H.grad[None]
+        # if not np.isnan(theta.grad[None]):
+        #     theta.grad[None] = max(-1E8, min(1E8, theta.grad[None]))
+        #     print('theta.grad', theta.grad[None])
+        #     theta[None] -= learning_rate * theta.grad[None]
+        #     theta[None] = max(math.pi * 0.2, min(math.pi * 0.4, theta[None]))
 
-        if iter % 10 == 0:
+        if iter % 20 == 0:
             # visualize
             forward(steps)
             for s in range(15, steps, 16):
